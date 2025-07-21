@@ -43,7 +43,8 @@ public class ExcelToJsonConverter {
                 for (int j = 0; j < columnCount; j++) {
                     String header = headerRow.getCell(j).getStringCellValue();
                     Cell cell = row.getCell(j);
-                    String value = (cell == null) ? "" : cell.toString();
+                    DataFormatter formatter = new DataFormatter();
+                    String value = (cell == null) ? "" : formatter.formatCellValue(cell);
                     rowData.put(header, value);
                 }
                 data.add(rowData);
