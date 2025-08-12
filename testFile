@@ -1,87 +1,103 @@
+package com.example.beam;
+
 import com.google.api.services.bigquery.model.TableRow;
+import org.apache.avro.Conversions;
+import org.apache.avro.LogicalTypes;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.util.Utf8;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.util.*;
 
-public class TableRowToGenericRecord {
+/**
+ * PTransform that converts PCollection<TableRow> -> PCollection<GenericRecord>
+ * using a provided Avro Schema. Handles nested records, arrays, maps, unions (including multi-type),
+ * logical types (basic handling), and primitive conversions.
+ */
+public class TableRowToGenericRecordTransform extends PTransform<PCollection<TableRow>, PCollection<GenericRecord>> {
 
-    public static PCollection<GenericRecord> convert(
-            PCollection<TableRow> tableRows, String avscSchemaPath) throws IOException {
+    private static final Logger LOG = LoggerFactory.getLogger(TableRowToGenericRecordTransform.class);
 
-        // Load the Avro schema
-        Schema schema = new Schema.Parser().parse(new File(avscSchemaPath));
+    private final Schema avroSchema;
 
-        return tableRows.apply("Convert TableRow to GenericRecord",
+    public TableRowToGenericRecordTransform(Schema avroSchema) {
+        this.avroSchema = avroSchema;
+    }
+
+    public static TableRowToGenericRecordTransform fromAvscFile(String avscPath) throws IOException {
+        Schema schema = new Schema.Parser().parse(new File(avscPath));
+        return new TableRowToGenericRecordTransform(schema);
+    }
+
+    @Override
+    public PCollection<GenericRecord> expand(PCollection<TableRow> input) {
+        return input.apply("TableRow->GenericRecord",
                 ParDo.of(new DoFn<TableRow, GenericRecord>() {
                     @ProcessElement
                     public void processElement(@Element TableRow row, OutputReceiver<GenericRecord> out) {
-                        GenericRecord record = convertRowToRecord(row, schema);
-                        out.output(record);
+                        try {
+                            GenericRecord r = convertTableRowToRecord(row, avroSchema);
+                            out.output(r);
+                        } catch (Exception ex) {
+                            // Fail-safe: log and skip row. Alternatively you could throw to fail the job.
+                            LOG.error("Failed converting TableRow to GenericRecord for row: {}. error: {}", row, ex.getMessage(), ex);
+                        }
                     }
 
-                    private GenericRecord convertRowToRecord(TableRow row, Schema schema) {
-                        GenericRecord record = new GenericData.Record(schema);
+                    private GenericRecord convertTableRowToRecord(TableRow row, Schema schema) {
+                        GenericRecord rec = new GenericData.Record(schema);
                         for (Schema.Field field : schema.getFields()) {
-                            Object value = row.get(field.name());
-                            record.put(field.name(), convertValue(value, field.schema()));
+                            Object rawVal = getFieldFromTableRow(row, field.name());
+                            Object converted = convertValue(rawVal, field.schema(), field.name());
+                            rec.put(field.name(), converted);
                         }
-                        return record;
+                        return rec;
+                    }
+
+                    /**
+                     * BigQuery TableRow get: TableRow.get(fieldName) returns Object.
+                     * If TableRow contains nested TableRow or List, BigQuery client may present them as Map/List.
+                     */
+                    private Object getFieldFromTableRow(TableRow row, String name) {
+                        if (row == null) return null;
+                        return row.get(name);
                     }
 
                     @SuppressWarnings("unchecked")
-                    private Object convertValue(Object value, Schema schema) {
-                        if (value == null) {
-                            return null;
-                        }
+                    private Object convertValue(Object value, Schema schema, String fieldPath) {
+                        if (value == null) return null;
 
                         Schema.Type type = schema.getType();
 
-                        // Handle UNION (nullable fields)
+                        // UNION handling: try to pick the correct branch when union has multiple non-null types
                         if (type == Schema.Type.UNION) {
-                            for (Schema subSchema : schema.getTypes()) {
-                                if (subSchema.getType() != Schema.Type.NULL) {
-                                    return convertValue(value, subSchema);
+                            List<Schema> types = schema.getTypes();
+                            // If union is nullable single-type like ["null","string"], prefer the non-null
+                            // But if multi-type, detect by runtime type and best-fit conversion
+                            // Try exact matches first:
+                            for (Schema s : types) {
+                                if (s.getType() == Schema.Type.NULL) continue;
+                                try {
+                                    if (matchesSchema(value, s)) {
+                                        return convertValue(value, s, fieldPath);
+                                    }
+                                } catch (Exception e) {
+                                    // ignore and try other branches
                                 }
                             }
-                        }
-
-                        switch (type) {
-                            case RECORD:
-                                return convertRowToRecord(
-                                        new TableRow().setFactory(Map.class).setAll((Map<String, Object>) value),
-                                        schema
-                                );
-                            case ARRAY:
-                                List<Object> list = new ArrayList<>();
-                                for (Object element : (List<?>) value) {
-                                    list.add(convertValue(element, schema.getElementType()));
-                                }
-                                return list;
-                            case STRING:
-                                return value.toString();
-                            case INT:
-                                return ((Number) value).intValue();
-                            case LONG:
-                                return ((Number) value).longValue();
-                            case DOUBLE:
-                                return ((Number) value).doubleValue();
-                            case FLOAT:
-                                return ((Number) value).floatValue();
-                            case BOOLEAN:
-                                return (Boolean) value;
-                            default:
-                                return value; // fallback
-                        }
-                    }
-                }));
-    }
-}
+                            // If no match, try converting with each non-null branch (first that doesn't throw)
+                            for (Schema s : types) {
+                                if (s.getType() == Schema.Type.NULL) continue;
+                                try {
