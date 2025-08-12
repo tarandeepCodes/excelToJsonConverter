@@ -101,3 +101,315 @@ public class TableRowToGenericRecordTransform extends PTransform<PCollection<Tab
                             for (Schema s : types) {
                                 if (s.getType() == Schema.Type.NULL) continue;
                                 try {
+                                    return convertValue(value, s, fieldPath);
+                                } catch (Exception e) {
+                                    // continue
+                                }
+                            }
+                            // fallback null if union contains null
+                            for (Schema s : types) {
+                                if (s.getType() == Schema.Type.NULL) return null;
+                            }
+                            // else give up
+                            LOG.warn("Union field {}: couldn't match value '{}' to any union branch; returning null", fieldPath, value);
+                            return null;
+                        }
+
+                        // Handle logical types
+                        LogicalTypes.LogicalType logicalType = schema.getLogicalType();
+
+                        switch (type) {
+                            case RECORD:
+                                // value may be TableRow, Map, or GenericRecord already
+                                if (value instanceof TableRow) {
+                                    return convertTableRowToRecord((TableRow) value, schema);
+                                } else if (value instanceof Map) {
+                                    // Map from BigQuery JSON parsing
+                                    Map<String, Object> map = (Map<String, Object>) value;
+                                    TableRow fake = new TableRow();
+                                    fake.putAll(map);
+                                    return convertTableRowToRecord(fake, schema);
+                                } else if (value instanceof GenericRecord) {
+                                    return value;
+                                } else {
+                                    LOG.warn("Field {} expected RECORD but got {}. Attempting best-effort.", fieldPath, value.getClass());
+                                    // attempt to coerce if it's a Map-like
+                                    if (value instanceof Map) {
+                                        Map<String,Object> map = (Map<String,Object>) value;
+                                        TableRow fake = new TableRow();
+                                        fake.putAll(map);
+                                        return convertTableRowToRecord(fake, schema);
+                                    }
+                                    return null;
+                                }
+                            case ARRAY:
+                                // value expected to be List
+                                if (value instanceof List) {
+                                    List<Object> src = (List<Object>) value;
+                                    List<Object> outList = new ArrayList<>();
+                                    Schema elemSchema = schema.getElementType();
+                                    int i = 0;
+                                    for (Object e : src) {
+                                        outList.add(convertValue(e, elemSchema, fieldPath + "[" + (i++) + "]"));
+                                    }
+                                    return outList;
+                                } else {
+                                    // sometimes BigQuery arrays are provided as single element or comma-separated string
+                                    LOG.warn("Field {} expected ARRAY but got {}. Wrapping single value into array.", fieldPath, value.getClass());
+                                    List<Object> out = new ArrayList<>();
+                                    out.add(convertValue(value, schema.getElementType(), fieldPath + "[0]"));
+                                    return out;
+                                }
+                            case MAP:
+                                // Avro map keys are strings; BigQuery doesn't directly produce maps usually.
+                                if (value instanceof Map) {
+                                    Map<String, Object> src = (Map<String, Object>) value;
+                                    Map<String, Object> outMap = new HashMap<>();
+                                    Schema valueSchema = schema.getValueType();
+                                    for (Map.Entry<String, Object> en : src.entrySet()) {
+                                        outMap.put(en.getKey(), convertValue(en.getValue(), valueSchema, fieldPath + "." + en.getKey()));
+                                    }
+                                    return outMap;
+                                } else if (value instanceof List) {
+                                    // Some representations encode map as list of {key:..., value:...} objects
+                                    Map<String,Object> outMap = new HashMap<>();
+                                    List<Object> list = (List<Object>) value;
+                                    for (Object item : list) {
+                                        if (item instanceof TableRow) {
+                                            TableRow tr = (TableRow) item;
+                                            Object k = tr.get("key");
+                                            Object v = tr.get("value");
+                                            if (k != null) outMap.put(k.toString(), convertValue(v, schema.getValueType(), fieldPath + "." + k.toString()));
+                                        } else if (item instanceof Map) {
+                                            Map<String,Object> m = (Map<String,Object>) item;
+                                            Object k = m.get("key");
+                                            Object v = m.get("value");
+                                            if (k != null) outMap.put(k.toString(), convertValue(v, schema.getValueType(), fieldPath + "." + k.toString()));
+                                        }
+                                    }
+                                    return outMap;
+                                } else {
+                                    LOG.warn("Field {} expected MAP but got {}.", fieldPath, value.getClass());
+                                    return null;
+                                }
+                            case STRING:
+                                // Avro may use Utf8 for strings, but GenericData will accept java.lang.String too
+                                if (value instanceof Utf8) return value.toString();
+                                return value.toString();
+                            case INT:
+                                return toInteger(value, fieldPath);
+                            case LONG:
+                                // also handle logical timestamp-millis / timestamp-micros (if value is string or number)
+                                if (logicalType != null && "timestamp-millis".equals(logicalType.getName())) {
+                                    return toLongFromTimestamp(value, fieldPath);
+                                }
+                                return toLong(value, fieldPath);
+                            case DOUBLE:
+                                return toDouble(value, fieldPath);
+                            case FLOAT:
+                                Number n = toNumber(value, fieldPath);
+                                return n == null ? null : n.floatValue();
+                            case BOOLEAN:
+                                return toBoolean(value, fieldPath);
+                            case BYTES:
+                                // If schema has decimal logical type, handle decimal conversion
+                                if (logicalType instanceof LogicalTypes.Decimal) {
+                                    return decimalToBytes(value, (LogicalTypes.Decimal) logicalType, schema, fieldPath);
+                                }
+                                // Common representation: base64-encoded String -> bytes
+                                if (value instanceof String) {
+                                    try {
+                                        byte[] bytes = Base64.getDecoder().decode((String) value);
+                                        return ByteBuffer.wrap(bytes);
+                                    } catch (IllegalArgumentException e) {
+                                        // not base64, try raw bytes
+                                        return ByteBuffer.wrap(((String) value).getBytes());
+                                    }
+                                } else if (value instanceof byte[]) {
+                                    return ByteBuffer.wrap((byte[]) value);
+                                }
+                                LOG.warn("Field {} BYTES conversion fallback for value type {}", fieldPath, value.getClass());
+                                return ByteBuffer.wrap(value.toString().getBytes());
+                            case FIXED:
+                                // treat similar to BYTES; the backing type for fixed is byte[]
+                                if (value instanceof String) {
+                                    try {
+                                        byte[] bytes = Base64.getDecoder().decode((String) value);
+                                        return bytes;
+                                    } catch (Exception e) {
+                                        return value.toString().getBytes();
+                                    }
+                                } else if (value instanceof byte[]) {
+                                    return value;
+                                } else {
+                                    return value.toString().getBytes();
+                                }
+                            case ENUM:
+                                // value must be a string matching one of the symbols
+                                String sval = value.toString();
+                                if (schema.hasEnumSymbol(sval)) {
+                                    return new GenericData.EnumSymbol(schema, sval);
+                                } else {
+                                    LOG.warn("Field {} ENUM value '{}' not in symbols {}. Using first symbol as fallback.", fieldPath, sval, schema.getEnumSymbols());
+                                    return new GenericData.EnumSymbol(schema, schema.getEnumSymbols().get(0));
+                                }
+                            default:
+                                LOG.warn("Field {}: unhandled Avro type {}. Returning raw value.", fieldPath, type);
+                                return value;
+                        }
+                    }
+
+                    // --- helpers for primitive conversions ---
+
+                    private Integer toInteger(Object v, String path) {
+                        Number n = toNumber(v, path);
+                        return n == null ? null : n.intValue();
+                    }
+
+                    private Long toLong(Object v, String path) {
+                        Number n = toNumber(v, path);
+                        return n == null ? null : n.longValue();
+                    }
+
+                    private Double toDouble(Object v, String path) {
+                        Number n = toNumber(v, path);
+                        return n == null ? null : n.doubleValue();
+                    }
+
+                    private Number toNumber(Object v, String path) {
+                        if (v instanceof Number) return (Number) v;
+                        if (v instanceof String) {
+                            String s = ((String) v).trim();
+                            if (s.isEmpty()) return null;
+                            try {
+                                if (s.contains(".") || s.contains("e") || s.contains("E")) return Double.parseDouble(s);
+                                else return Long.parseLong(s);
+                            } catch (NumberFormatException nfe) {
+                                LOG.warn("Field {}: could not parse number from string '{}'", path, s);
+                                return null;
+                            }
+                        }
+                        LOG.warn("Field {}: cannot coerce {} to number", path, v.getClass());
+                        return null;
+                    }
+
+                    private Long toLongFromTimestamp(Object v, String path) {
+                        // Accept number (epoch millis) or ISO string -> parse to epoch millis
+                        if (v instanceof Number) return ((Number) v).longValue();
+                        if (v instanceof String) {
+                            String s = (String) v;
+                            try {
+                                // try parse as long string first
+                                return Long.parseLong(s);
+                            } catch (NumberFormatException ignored) {}
+                            // Try ISO-8601 parsing:
+                            try {
+                                return java.time.Instant.parse(s).toEpochMilli();
+                            } catch (Exception e) {
+                                LOG.warn("Field {}: timestamp string parse failed for '{}'", path, s);
+                                return null;
+                            }
+                        }
+                        return null;
+                    }
+
+                    private Boolean toBoolean(Object v, String path) {
+                        if (v instanceof Boolean) return (Boolean) v;
+                        if (v instanceof String) {
+                            String s = ((String) v).toLowerCase(Locale.ROOT).trim();
+                            if (s.equals("true") || s.equals("1") || s.equals("yes")) return true;
+                            if (s.equals("false") || s.equals("0") || s.equals("no")) return false;
+                        }
+                        LOG.warn("Field {} cannot coerce {} to boolean", path, v.getClass());
+                        return null;
+                    }
+
+                    /**
+                     * Returns true if the runtime value plausibly matches the given avro schema type.
+                     * This is used to pick branches of multi-type unions.
+                     */
+                    @SuppressWarnings("unchecked")
+                    private boolean matchesSchema(Object value, Schema schema) {
+                        if (value == null) return schema.getType() == Schema.Type.NULL;
+                        Schema.Type t = schema.getType();
+                        switch (t) {
+                            case RECORD:
+                                return (value instanceof TableRow) || (value instanceof Map) || (value instanceof GenericRecord);
+                            case ARRAY:
+                                return value instanceof List;
+                            case MAP:
+                                return value instanceof Map || value instanceof List;
+                            case STRING:
+                                return value instanceof String || value instanceof Utf8;
+                            case INT:
+                            case LONG:
+                            case FLOAT:
+                            case DOUBLE:
+                                return (value instanceof Number) || (value instanceof String && isNumeric((String) value));
+                            case BOOLEAN:
+                                return (value instanceof Boolean) || (value instanceof String && ("true".equalsIgnoreCase((String) value) || "false".equalsIgnoreCase((String) value)));
+                            case BYTES:
+                            case FIXED:
+                                return (value instanceof byte[]) || (value instanceof String);
+                            case ENUM:
+                                return value instanceof String;
+                            default:
+                                return true; // optimistic fallback
+                        }
+                    }
+
+                    private boolean isNumeric(String s) {
+                        if (s == null) return false;
+                        try {
+                            Double.parseDouble(s);
+                            return true;
+                        } catch (NumberFormatException e) {
+                            return false;
+                        }
+                    }
+
+                    /**
+                     * Convert decimal-like values to bytes according to LogicalTypes.Decimal.
+                     * This is a *basic* implementation: it expects value as BigDecimal or String.
+                     */
+                    private ByteBuffer decimalToBytes(Object value, LogicalTypes.Decimal decType, Schema schema, String path) {
+                        BigDecimal bd = null;
+                        if (value instanceof BigDecimal) bd = (BigDecimal) value;
+                        else if (value instanceof Number) bd = BigDecimal.valueOf(((Number) value).doubleValue());
+                        else {
+                            String s = value.toString();
+                            try {
+                                bd = new BigDecimal(s);
+                            } catch (NumberFormatException e) {
+                                LOG.warn("Field {}: cannot parse decimal from '{}'", path, value);
+                                return null;
+                            }
+                        }
+                        int scale = decType.getScale();
+                        int precision = decType.getPrecision();
+                        bd = bd.setScale(scale, BigDecimal.ROUND_HALF_UP);
+                        // convert to unscaled bytes (two's complement)
+                        byte[] unscaled = bd.unscaledValue().toByteArray();
+                        // if schema is fixed, it must match fixed size; else use bytes
+                        if (schema.getType() == Schema.Type.FIXED) {
+                            int size = schema.getFixedSize();
+                            if (unscaled.length == size) {
+                                return ByteBuffer.wrap(unscaled);
+                            } else if (unscaled.length < size) {
+                                byte[] padded = new byte[size];
+                                int pad = size - unscaled.length;
+                                System.arraycopy(unscaled, 0, padded, pad, unscaled.length);
+                                return ByteBuffer.wrap(padded);
+                            } else {
+                                // too big
+                                LOG.warn("Field {} decimal unscaled length {} exceeds fixed size {}", path, unscaled.length, size);
+                                return ByteBuffer.wrap(unscaled);
+                            }
+                        } else {
+                            return ByteBuffer.wrap(unscaled);
+                        }
+                    }
+
+                }));
+    }
+}
