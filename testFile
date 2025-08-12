@@ -1,0 +1,87 @@
+import com.google.api.services.bigquery.model.TableRow;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollection;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public class TableRowToGenericRecord {
+
+    public static PCollection<GenericRecord> convert(
+            PCollection<TableRow> tableRows, String avscSchemaPath) throws IOException {
+
+        // Load the Avro schema
+        Schema schema = new Schema.Parser().parse(new File(avscSchemaPath));
+
+        return tableRows.apply("Convert TableRow to GenericRecord",
+                ParDo.of(new DoFn<TableRow, GenericRecord>() {
+                    @ProcessElement
+                    public void processElement(@Element TableRow row, OutputReceiver<GenericRecord> out) {
+                        GenericRecord record = convertRowToRecord(row, schema);
+                        out.output(record);
+                    }
+
+                    private GenericRecord convertRowToRecord(TableRow row, Schema schema) {
+                        GenericRecord record = new GenericData.Record(schema);
+                        for (Schema.Field field : schema.getFields()) {
+                            Object value = row.get(field.name());
+                            record.put(field.name(), convertValue(value, field.schema()));
+                        }
+                        return record;
+                    }
+
+                    @SuppressWarnings("unchecked")
+                    private Object convertValue(Object value, Schema schema) {
+                        if (value == null) {
+                            return null;
+                        }
+
+                        Schema.Type type = schema.getType();
+
+                        // Handle UNION (nullable fields)
+                        if (type == Schema.Type.UNION) {
+                            for (Schema subSchema : schema.getTypes()) {
+                                if (subSchema.getType() != Schema.Type.NULL) {
+                                    return convertValue(value, subSchema);
+                                }
+                            }
+                        }
+
+                        switch (type) {
+                            case RECORD:
+                                return convertRowToRecord(
+                                        new TableRow().setFactory(Map.class).setAll((Map<String, Object>) value),
+                                        schema
+                                );
+                            case ARRAY:
+                                List<Object> list = new ArrayList<>();
+                                for (Object element : (List<?>) value) {
+                                    list.add(convertValue(element, schema.getElementType()));
+                                }
+                                return list;
+                            case STRING:
+                                return value.toString();
+                            case INT:
+                                return ((Number) value).intValue();
+                            case LONG:
+                                return ((Number) value).longValue();
+                            case DOUBLE:
+                                return ((Number) value).doubleValue();
+                            case FLOAT:
+                                return ((Number) value).floatValue();
+                            case BOOLEAN:
+                                return (Boolean) value;
+                            default:
+                                return value; // fallback
+                        }
+                    }
+                }));
+    }
+}
